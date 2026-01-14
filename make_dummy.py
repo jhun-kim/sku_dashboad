@@ -1,44 +1,35 @@
+from datetime import datetime
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
 
-# 1. 기초 설정
-items = [f"수입부품_{chr(65 + i)}" for i in range(10)]  # 수입부품_A ~ J (10종)
-start_date = datetime(2025, 1, 1)
-data_rows = 10000
+file_path = 'inventory_10k_data.xlsx'
+df_history = pd.read_excel(file_path)
 
-# 2. 거래 내역(Transaction) 데이터 생성
-transactions = []
-for i in range(data_rows):
-    item = np.random.choice(items)
-    date = start_date + timedelta(days=np.random.randint(0, 350))
-    # 입고(Purchase)와 출고(Sale)를 4:6 비율로 생성
-    trans_type = np.random.choice(['입고', '출고'], p=[0.4, 0.6])
-    qty = np.random.randint(10, 100)
+df_history['datetime'] = df_history['날짜'].apply(lambda x: str(x).split(' ')[0])
+df_history['datetime'] = df_history['datetime'].apply(lambda x: datetime.strptime(str(x), "%Y-%m-%d"))
 
-    # 입고 시에만 단가 발생 (5,000원 ~ 15,000원 사이)
-    price = np.random.randint(50, 151) * 100 if trans_type == '입고' else 0
+df_history['날짜'] = df_history['datetime']
 
-    transactions.append([date, item, trans_type, qty, price])
+# 2. '구분'이 '입고'인 데이터만 필터링
+# df_1 = df_history[df_history['구분'] == '입고'].copy()
+# df_2 = df_history[df_history['구분'] != '입고'].copy()
 
-# 데이터프레임 생성 및 날짜 정렬
-df_history = pd.DataFrame(transactions, columns=['날짜', '품목명', '구분', '수량', '단가'])
-df_history = df_history.sort_values(by=['날짜', '품목명']).reset_index(drop=True)
 
-# 3. 마스터 데이터(재고 분석용) 생성
-master_data = []
-for item in items:
-    # 현재고, 1년 평균 판매량, 3개월 평균 판매량 가상 생성
-    stock = np.random.randint(50, 500)
-    avg_12m = np.random.randint(100, 300)
-    avg_3m = avg_12m + np.random.randint(-50, 100)  # 최근 판매 변동성 부여
-    master_data.append([item, stock, avg_12m, avg_3m])
+# 3. 가중치를 위한 총 금액(수량 * 단가) 컬럼 생성
+df_history['총금액'] = df_history['수량'] * df_history['단가']
 
-df_master = pd.DataFrame(master_data, columns=['품목명', '현재고', '1년_월평균판매', '3개월_월평균판매'])
+# 4. 날짜, 품목명별로 그룹화하여 수량과 총금액 합산
+grouped = df_history.groupby(['날짜', '품목명', '구분']).agg({
+    '수량': 'sum',
+    '총금액': 'sum'
+}).reset_index()
 
-# 4. 엑셀 파일로 저장 (2개의 시트)
-with pd.ExcelWriter('inventory_test_data.xlsx', engine='openpyxl') as writer:
-    df_history.to_excel(writer, sheet_name='거래이력', index=False)
-    df_master.to_excel(writer, sheet_name='재고분석기준', index=False)
+# 5. 최종 단가 계산 (모든 합계 금액 / 모든 수량 합계)
+grouped['평균단가'] = grouped['총금액'] / grouped['수량']
+grouped['단가'] = grouped['평균단가']
+# 결과 출력
+print(grouped[['날짜', '품목명', '구분', '수량', '평균단가']])
 
-print("✅ 'inventory_test_data.xlsx' 파일이 성공적으로 생성되었습니다.")
+# df_3 = pd.concat(df_1, df_2).reset_index(drop=True)
+df_history = df_history.sort_values(['날짜'], ascending=True).reset_index(drop=True)
+
+df_history.to_excel('inventory_data.xlsx', index=False)
