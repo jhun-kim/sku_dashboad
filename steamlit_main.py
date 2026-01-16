@@ -125,6 +125,37 @@ def process_transaction(date, item, action, qty, price=0):
     st.session_state.history = pd.concat([st.session_state.history, pd.DataFrame([new_record])], ignore_index=True)
     st.session_state.history = st.session_state.history.sort_values(by='날짜').reset_index(drop=True)
 
+# --- [추가] 3-1. 판매 지표 계산 로직 ---
+def calculate_sales_metrics(item_name):
+    """
+    특정 품목의 1년 평균 및 최근 3개월 평균 판매량을 계산
+    """
+    history = st.session_state.history
+    now = datetime.now()
+
+    # 해당 품목의 '출고' 기록만 필터링
+    sales_df = history[(history['품목명'] == item_name) & (history['구분'] == '출고')].copy()
+
+    if sales_df.empty:
+        return 0, 0, 0
+
+    # 날짜 필터링을 위한 기준 설정
+    one_year_ago = now - pd.Timedelta(days=365)
+    three_months_ago = now - pd.Timedelta(days=90)
+
+    # 1. 1년 기준 월평균 판매량 (최근 365일 판매량 / 12)
+    last_year_sales = sales_df[sales_df['날짜'] >= one_year_ago]['수량'].sum()
+    avg_12m = last_year_sales / 12
+
+    # 2. 최근 3개월 월평균 판매량 (최근 90일 판매량 / 3)
+    last_3m_sales = sales_df[sales_df['날짜'] >= three_months_ago]['수량'].sum()
+    avg_3m = last_3m_sales / 3
+
+    # 3. 현재고
+    current_stock = sum(b['qty'] for b in st.session_state.inventory_queues.get(item_name, []))
+
+    return current_stock, avg_12m, avg_3m
+
 # --- 4. 메인 UI 구성 ---
 initialize_state()
 
