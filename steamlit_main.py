@@ -241,6 +241,63 @@ if app_mode == "실시간 FIFO 관리":
             st.info("출고 시 상세 배치 정보가 여기에 표시됩니다.")
 
 elif app_mode == "데이터 분석/트래킹":
-    # (트래킹 대시보드 코드는 이전과 동일하게 유지하거나 필요시 추가)
-    st.title("🔍 데이터 트래킹 대시보드")
-    st.write("사이드바에서 분석 모드를 선택하셨습니다.")
+    st.title("🔍 수입 적정재고 검토 대시보드")
+    st.info("수입 리드 타임을 고려하여 품목별 발주 필요성을 분석합니다. (기준일: 2026-01-14)")
+
+    # 1. 품목 선택 (90여 개의 수입 품목 대응)
+    item_list = sorted(st.session_state.history['품목명'].unique())
+    if not item_list:
+        st.warning("분석할 데이터가 없습니다. 먼저 입고 기록을 생성하세요.")
+    else:
+        selected_item = st.selectbox("📊 분석할 품목을 선택하세요", item_list)
+
+        # 데이터 계산
+        curr_stock, m12_avg, m3_avg = calculate_sales_metrics(selected_item)
+
+        # 2. 핵심 지표 레이아웃 (Metrics)
+        st.divider()
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            st.metric("현재 창고 재고", f"{curr_stock:,} 개")
+
+        with col2:
+            st.metric("1년 평균 판매 (월)", f"{int(m12_avg)} 개")
+
+        with col3:
+            # 최근 3개월 판매 추세 계산 (전년 평균 대비)
+            trend = m3_avg - m12_avg
+            st.metric("최근 3개월 판매 (월)", f"{int(m3_avg)} 개", delta=f"{trend:,.1f} (추세)")
+
+        with col4:
+            # 재고 보유 개월 수 (현재고 / 최근 3개월 판매량)
+            stock_months = curr_stock / m3_avg if m3_avg > 0 else 0
+            st.metric("재고 소진 예정 (개월)", f"{stock_months:.1f} 개월분")
+
+        # 3. 발주 제언 시각화
+        st.subheader("💡 AI 발주 판단 가이드")
+
+        # 간단한 로직 예시: 재고가 3개월 판매량보다 적으면 발주 검토
+        lead_time_buffer = 2.0  # 수입 리드타임 2개월 가정
+        if stock_months < lead_time_buffer:
+            st.error(f"⚠️ **발주 검토 필요**: 현재 재고가 리드타임({lead_time_buffer}개월) 대비 부족합니다.")
+        elif stock_months < lead_time_buffer + 1:
+            st.warning("🟡 **관찰 필요**: 재고 수준이 적정선 하단에 도달했습니다.")
+        else:
+            st.success("✅ **재고 충분**: 현재 안정적인 재고 수준을 유지하고 있습니다.")
+
+        # 4. 상세 판매 차트 (Optional)
+        st.subheader("📈 월별 출고 트렌드")
+        item_history = st.session_state.history[
+            (st.session_state.history['품목명'] == selected_item) &
+            (st.session_state.history['구분'] == '출고')
+            ].set_index('날짜')
+
+        if not item_history.empty:
+            # 월별로 리샘플링하여 합계 계산
+            monthly_sales = item_history['수량'].resample('ME').sum()
+            monthly_growth = monthly_sales.pct_change() * 100
+            st.metric("전월 대비 성장률", f"{monthly_sales.iloc[-1]:,.0f} 개", delta=f"{monthly_growth.iloc[-2]:.1f}%")
+            st.bar_chart(monthly_sales)
+        else:
+            st.write("판매 기록이 없어 차트를 표시할 수 없습니다.")
