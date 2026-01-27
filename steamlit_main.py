@@ -2,128 +2,167 @@ import streamlit as st
 import pandas as pd
 from collections import deque
 from datetime import datetime
-from io import BytesIO
+import hashlib  # 중복 방지용 해시 생성
 import os
 
 # --- 1. 페이지 설정 및 스타일 ---
-st.set_page_config(layout="wide", page_title="AI Tracking System")
+st.set_page_config(layout="wide", page_title="AI Tracking System 2026")
 st.markdown("""
     <style>
-    [data-testid="stSidebar"] { min-width: 320px; max-width: 320px; }
-    .stMetric { background-color: #f0f2f6; padding: 15px; border-radius: 10px; }
+    [data-testid="stSidebar"] { min-width: 320px; }
+    .stMetric { background-color: #f8f9fa; padding: 15px; border-radius: 10px; border: 1px solid #dee2e6; }
     </style>
     """, unsafe_allow_html=True)
 
 
-# --- 2. 초기 상태 설정 및 데이터 로드 ---
+# --- 2. 핵심 유틸리티 함수 ---
+
+def generate_row_hash(row):
+    """데이터 행의 고유 해시값 생성 (날짜, 품목명, 구분, 수량, 단가 기준)"""
+    payload = f"{row['날짜']}{row['품목명']}{row['구분']}{row['수량']}{row['단가']}"
+    return hashlib.md5(payload.encode()).hexdigest()
+
+
 def initialize_state():
+    """세션 상태 초기화 및 데이터 로드"""
     if 'history' not in st.session_state:
         file_path = 'inventory_10k_data.xlsx'
         if os.path.exists(file_path):
             df = pd.read_excel(file_path)
             df['날짜'] = pd.to_datetime(df['날짜'])
+            # 기존 데이터에 세부구분 컬럼이 없을 경우 기본값 할당
+            if '세부구분' not in df.columns:
+                df['세부구분'] = df['구분'].map({'입고': '매입', '출고': '매출'})
+            if 'hash' not in df.columns:
+                df['hash'] = df.apply(generate_row_hash, axis=1)
             st.session_state.history = df.sort_values(by='날짜').reset_index(drop=True)
         else:
-            st.session_state.history = pd.DataFrame(columns=['날짜', '품목명', '구분', '수량', '단가', '매출원가', '비고'])
+            st.session_state.history = pd.DataFrame(columns=['날짜', '품목명', '구분', '세부구분', '수량', '단가', '매출원가', '비고', 'hash'])
 
     if 'inventory_queues' not in st.session_state:
         reconstruct_queues()
-
     if 'latest_fifo_detail' not in st.session_state:
         st.session_state.latest_fifo_detail = pd.DataFrame()
 
 
 def reconstruct_queues():
-    """전체 히스토리를 순회하여 현재 시점의 품목별 FIFO 큐(재고 층)를 복원"""
+    """전체 히스토리를 순회하여 FIFO 큐 복원"""
     items = st.session_state.history['품목명'].unique()
     queues = {item: deque() for item in items}
-    for _, row in st.session_state.history.iterrows():
+    # 날짜 순서대로 다시 계산하여 무결성 보장
+    sorted_hist = st.session_state.history.sort_values('날짜')
+    for _, row in sorted_hist.iterrows():
         item = row['품목명']
         if row['구분'] == '입고':
             queues[item].append({'date': row['날짜'], 'qty': row['수량'], 'price': row['단가']})
         elif row['구분'] == '출고':
             qty = row['수량']
-            while qty > 0 and queues.get(item):
-                if queues[item][0]['qty'] <= qty:
-                    qty -= queues[item][0]['qty']
-                    queues[item].popleft()
+            q = queues.get(item, deque())
+            while qty > 0 and q:
+                if q[0]['qty'] <= qty:
+                    qty -= q[0]['qty']
+                    q.popleft()
                 else:
-                    queues[item][0]['qty'] -= qty
+                    q[0]['qty'] -= qty
                     qty = 0
     st.session_state.inventory_queues = queues
 
 
-# --- 3. 핵심 비즈니스 로직: FIFO 엔진 ---
-def process_transaction(date, item, action, qty, price=0):
+# --- 3. 비즈니스 로직 ---
+
+# --- [핵심 로직] FIFO 엔진 및 비고 기록 기능 ---
+def process_transaction(date, item, action, sub_type, qty, price=0, row_hash=None):
+    """
+    단일 트랜잭션을 처리하며, 출고 시 어떤 배치의 재고가 사용되었는지 비고에 기록함
+    """
     date = pd.to_datetime(date)
+    if not row_hash:
+        row_hash = hashlib.md5(f"{date}{item}{action}{sub_type}{qty}{price}".encode()).hexdigest()
+
     new_record = {
-        '날짜': date, '품목명': item, '구분': action,
+        '날짜': date, '품목명': item, '구분': action, '세부구분': sub_type,
         '수량': qty, '단가': price if action == '입고' else 0,
-        '매출원가': 0, '비고': ''
+        '매출원가': 0, '비고': '', 'hash': row_hash
     }
 
     if item not in st.session_state.inventory_queues:
         st.session_state.inventory_queues[item] = deque()
+    queue = st.session_state.inventory_queues[item]
 
     if action == "입고":
-        st.session_state.inventory_queues[item].append({'date': date, 'qty': qty, 'price': price})
-        new_record['비고'] = f"{qty}개 입고 완료"
-        # 입고 시에는 분석 상세 내역 초기화
-        st.session_state.latest_fifo_detail = pd.DataFrame()
-        st.session_state.latest_batch_status = pd.DataFrame()
+        queue.append({'date': date, 'qty': qty, 'price': price})
+        new_record['비고'] = f"[{sub_type}] {qty}개 입고 완료"
 
     elif action == "출고":
-        remaining_needed = qty
+        remaining = qty
         total_cogs = 0
-        fifo_breakdown = []  # 차감 내역
-        batch_status = []  # 차감 후 잔량 현황
+        details = []  # 비고 작성을 위한 상세 내역 리스트
 
-        queue = st.session_state.inventory_queues[item]
-
-        while remaining_needed > 0 and queue:
+        while remaining > 0 and queue:
             batch = queue[0]
             batch_date_str = batch['date'].strftime('%Y-%m-%d')
 
-            if batch['qty'] <= remaining_needed:
-                # 1. 배치 완전 소진
+            if batch['qty'] <= remaining:
+                # 배치 완전 소진
                 use_qty = batch['qty']
                 cost = use_qty * batch['price']
                 total_cogs += cost
-                remaining_needed -= use_qty
-
-                # 차감 내역 저장
-                fifo_breakdown.append({'입고날짜': batch_date_str, '차감수량': use_qty, '단가': batch['price'], '금액': cost})
-
-                # 차감 후 잔량 저장 (0개)
-                batch_status.append({'입고날짜': batch_date_str, '품목명': item, '재고수량': 0, '단가': batch['price'], '금액': 0})
-
-                queue.popleft()  # 큐에서 제거
+                remaining -= use_qty
+                details.append(f"{batch_date_str}분 {use_qty}개(@{batch['price']:,}원)")
+                queue.popleft()
             else:
-                # 2. 배치 부분 소진
-                use_qty = remaining_needed
+                # 배치 부분 소진
+                use_qty = remaining
                 cost = use_qty * batch['price']
                 total_cogs += cost
-                batch['qty'] -= use_qty  # 잔량 업데이트
-                remaining_needed = 0
-
-                # 차감 내역 저장
-                fifo_breakdown.append({'입고날짜': batch_date_str, '차감수량': use_qty, '단가': batch['price'], '금액': cost})
-
-                # 차감 후 잔량 저장 (남은 수량)
-                rem_qty = batch['qty']
-                batch_status.append({'입고날짜': batch_date_str, '품목명': item, '재고수량': rem_qty, '단가': batch['price'],
-                                     '금액': rem_qty * batch['price']})
+                batch['qty'] -= use_qty
+                remaining = 0
+                details.append(f"{batch_date_str}분 {use_qty}개(@{batch['price']:,}원)")
 
         new_record['매출원가'] = total_cogs
-        new_record['비고'] = "출고 완료" if remaining_needed == 0 else "재고 부족 발생"
 
-        # 세션 상태 업데이트
-        st.session_state.latest_fifo_detail = pd.DataFrame(fifo_breakdown)
-        st.session_state.latest_batch_status = pd.DataFrame(batch_status)
+        # --- [수정 포인트] 비고란에 상세 출고 내역 작성 ---
+        if remaining == 0:
+            detail_str = ", ".join(details)
+            new_record['비고'] = f"[{sub_type}] 출고완료 ({detail_str})"
+        else:
+            detail_str = ", ".join(details) if details else "재고 없음"
+            new_record['비고'] = f"⚠️재고부족 (일부출고: {detail_str}, 미출고: {remaining}개)"
 
-    # 히스토리 반영
+    # 히스토리에 기록 추가
     st.session_state.history = pd.concat([st.session_state.history, pd.DataFrame([new_record])], ignore_index=True)
-    st.session_state.history = st.session_state.history.sort_values(by='날짜').reset_index(drop=True)
+
+
+# --- 4. 엑셀 업로드 처리 ---
+
+def handle_excel_upload(uploaded_file):
+    try:
+        df = pd.read_excel(uploaded_file)
+        required = ['날짜', '품목명', '구분', '세부구분', '수량', '단가']
+        if not all(c in df.columns for c in required):
+            st.error(f"양식 오류! 필수 컬럼: {required}")
+            return
+
+        df['날짜'] = pd.to_datetime(df['날짜'])
+        df['hash'] = df.apply(generate_row_hash, axis=1)
+
+        existing_hashes = set(st.session_state.history['hash'].tolist())
+        new_data = df[~df['hash'].isin(existing_hashes)].copy()
+
+        if new_data.empty:
+            st.warning("추가할 신규 데이터가 없습니다.")
+            return
+
+        new_data = new_data.sort_values('날짜')
+        with st.status("데이터 분석 중...") as status:
+            for _, row in new_data.iterrows():
+                process_transaction(row['날짜'], row['품목명'], row['구분'], row['세부구분'], row['수량'], row['단가'], row['hash'])
+            status.update(label="반영 완료!", state="complete")
+
+        st.session_state.history = st.session_state.history.sort_values('날짜').reset_index(drop=True)
+        st.rerun()
+    except Exception as e:
+        st.error(f"파일 처리 오류: {e}")
 
 # --- [추가] 3-1. 판매 지표 계산 로직 ---
 def calculate_sales_metrics(item_name):
@@ -156,121 +195,169 @@ def calculate_sales_metrics(item_name):
 
     return current_stock, avg_12m, avg_3m
 
+
+# --- [추가] 3-2. 실시간 재고 집계 함수 ---
+def get_inventory_summary():
+    """현재 FIFO 큐에 남은 데이터를 기반으로 품목별 요약 생성"""
+    summary_data = []
+
+    for item, queue in st.session_state.inventory_queues.items():
+        total_qty = sum(batch['qty'] for batch in queue)
+        total_value = sum(batch['qty'] * batch['price'] for batch in queue)
+        avg_price = total_value / total_qty if total_qty > 0 else 0
+
+        if total_qty >= 0:  # 재고가 0인 품목도 포함 (필요시 > 0으로 변경)
+            summary_data.append({
+                "품목명": item,
+                "현재고 수량": total_qty,
+                "평균 매입단가": avg_price,
+                "재고 자산금액": total_value
+            })
+
+    return pd.DataFrame(summary_data)
+
+
+# --- [추가] 3-3. 차기 출고 예정 재고(FIFO Queue) 분석 함수 ---
+def get_next_out_schedule():
+    """각 품목별로 FIFO 기준 가장 먼저 출고될 재고 날짜와 수량 분석"""
+    schedule_data = []
+
+    for item, queue in st.session_state.inventory_queues.items():
+        if not queue:
+            continue
+
+        # 1순위 (가장 오래된 재고)
+        first_batch = queue[0]
+
+        # 2순위 (있을 경우에만)
+        second_batch = queue[1] if len(queue) > 1 else None
+
+        schedule_data.append({
+            "품목명": item,
+            "1순위 출고예정일": first_batch['date'],
+            "1순위 대기수량": first_batch['qty'],
+            "1순위 단가": first_batch['price'],
+            "2순위 출고예정일": second_batch['date'] if second_batch else None,
+            "2순위 대기수량": second_batch['qty'],
+            "전체 재고층 수": len(queue)
+        })
+
+    return pd.DataFrame(schedule_data)
+
 # --- 4. 메인 UI 구성 ---
 initialize_state()
 
 # [사이드바 영역]
 with st.sidebar:
-    st.title("⚙️ 시스템 메뉴")
-    app_mode = st.radio("작업 모드 선택", ["실시간 FIFO 관리", "데이터 분석/트래킹"])
+    st.title("📦 AI 재고 관리")
+    app_mode = st.radio("메뉴 선택", ["데이터 일괄 업로드", "데이터 분석/트래킹"])
     st.divider()
+    # 템플릿에도 세부구분 추가
+    template = pd.DataFrame(columns=['날짜', '품목명', '구분', '세부구분', '수량', '단가'])
+    st.download_button("📥 업로드 양식 다운로드", data=template.to_csv(index=False).encode('utf-8-sig'),
+                       file_name="template_v2.csv")
 
-    # [사이드바 실시간 재고 현황]
-    st.subheader("📦 품목별 현재고 현황")
-    stock_data = []
-    # 모든 품목을 순회하며 큐에 남은 수량 합산
-    for item, queue in st.session_state.inventory_queues.items():
-        total_q = sum(b['qty'] for b in queue)
-        stock_data.append({"품목명": item, "현재고": total_q})
+if app_mode == "데이터 일괄 업로드":
+    st.title("📥 대량 입출고 업로드 및 이력")
 
-    if stock_data:
-        st.dataframe(pd.DataFrame(stock_data).sort_values('품목명'), hide_index=True, use_container_width=True)
-    else:
-        st.info("데이터가 없습니다.")
-
-    if st.button("💾 최종 상태 엑셀 저장", use_container_width=True):
-        st.session_state.history.to_excel('inventory_10k_data.xlsx', index=False)
-        st.success("엑셀 파일이 업데이트되었습니다.")
-
-# --- 5. 모드별 화면 출력 ---
-
-if app_mode == "실시간 FIFO 관리":
-    st.title("📥 입출고 관리")
-
-    # 입력창
-    with st.expander("📝 입출고 기록 입력", expanded=True):
-        c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
-        with c1:
-            t_date = st.date_input("날짜", datetime.now())
-        with c2:
-            item_list = sorted(st.session_state.history['품목명'].unique()) if not st.session_state.history.empty else [
-                "품목A"]
-            t_item = st.selectbox("품목명", item_list)
-        with c3:
-            t_qty = st.number_input("수량", min_value=1, value=10)
-        with c4:
-            t_price = st.number_input("입고단가", min_value=0, value=1000)
-
-        btn_in, btn_out = st.columns(2)
-        if btn_in.button("📥 입고 실행", use_container_width=True):
-            process_transaction(t_date, t_item, "입고", t_qty, t_price)
-            st.rerun()
-        if btn_out.button("📤 출고 실행", use_container_width=True, type="primary"):
-            process_transaction(t_date, t_item, "출고", t_qty)
-            st.rerun()
+    with st.expander("📁 신규 데이터 업로드"):
+        uploaded_file = st.file_uploader("엑셀 파일을 선택하세요", type=['xlsx'])
+        if uploaded_file and st.button("🚀 데이터 반영하기", use_container_width=True):
+            handle_excel_upload(uploaded_file)
 
     st.divider()
+    st.subheader("🔍 데이터 필터링 (세부구분 포함)")
+    df_display = st.session_state.history.copy()
 
-    # 하단 3분할 레이아웃
-    col_left, col_mid, col_right = st.columns([1.2, 1, 0.8])
-
-    with col_left:
-        st.subheader("📋 전체 이력")
-        # 현재 선택한 품목의 실시간 재고를 Metric으로 표시
-        curr_stock = sum(b['qty'] for b in st.session_state.inventory_queues.get(t_item, []))
-        st.metric(f"{t_item} 실시간 재고", f"{curr_stock:,} 개")
-        st.dataframe(st.session_state.history, use_container_width=True, height=450)
-
-    with col_mid:
-        st.subheader("🕒 최근 거래")
-
-        # 1. 세션 상태에서 데이터를 복사
-        # if 'history' in st.session_state:
-        up_df = st.session_state.history.copy()
-
-        # 2. 날짜 기준 내림차순 정렬 (최신 날짜가 위로)
-        # 오타 수정: sort_value -> sort_values
-        up_df = up_df.sort_values('날짜', ascending=False)
-
-        # 3. 데이터프레임 출력
-        # 'up_df.history'가 아니라 이미 복사본인 'up_df'를 사용해야 합니다.
-        # tail(10)은 마지막 10개, 최신 10개를 보려면 정렬 후 head(10)을 쓰기도 합니다.
-        st.dataframe(up_df.head(10))
-        # else:
-        #     st.sidebar.write("기록이 없습니다.")
-
-    with col_right:
-        st.subheader("🧪 FIFO 원가 분석 (방금 출고분)")
-
-        if not st.session_state.latest_fifo_detail.empty:
-            st.write("▼ 이번 거래로 차감된 상세 내역")
-            st.table(st.session_state.latest_fifo_detail)
-
-            total_sum = st.session_state.latest_fifo_detail['금액'].sum()
-            st.success(f"**총 매출원가 적용액:** {total_sum:,.0f}원")
-
-            st.divider()  # 시각적 구분선
-
-            # [추가 요청 기능] 차감된 배치의 현재 잔량 현황 표기
-            st.write("📅 **관련 입고분 현재 잔량 현황**")
-            if 'latest_batch_status' in st.session_state and not st.session_state.latest_batch_status.empty:
-                st.dataframe(
-                    st.session_state.latest_batch_status,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "재고수량": st.column_config.NumberColumn(format="%d 개"),
-                        "단가": st.column_config.NumberColumn(format="%d 원"),
-                        "금액": st.column_config.NumberColumn(format="%d 원")
-                    }
-                )
-
-                # 잔량 금액 합계 수식 예시 (LaTeX)
-                total_rem_val = st.session_state.latest_batch_status['금액'].sum()
-                st.info(f"위 배치들의 남은 자산 가치 합계: {total_rem_val:,.0f}원")
+    f1, f2, f3 = st.columns([1.5, 1.5, 2])
+    with f1:
+        selected_items = st.multiselect("📦 품목 선택", sorted(df_display['품목명'].unique()))
+    with f2:
+        # 세부구분 필터 추가
+        all_subtypes = sorted(df_display['세부구분'].unique())
+        selected_subs = st.multiselect("📂 세부구분 선택", all_subtypes, default=all_subtypes)
+    with f3:
+        if not df_display.empty:
+            date_range = st.date_input("📅 기간", value=(df_display['날짜'].min().date(), df_display['날짜'].max().date()))
         else:
-            st.info("출고 시 상세 배치 정보가 여기에 표시됩니다.")
+            date_range = []
 
+    # 필터 적용
+    if selected_items: df_display = df_display[df_display['품목명'].isin(selected_items)]
+    df_display = df_display[df_display['세부구분'].isin(selected_subs)]
+    if len(date_range) == 2:
+        df_display = df_display[
+            (df_display['날짜'].dt.date >= date_range[0]) & (df_display['날짜'].dt.date <= date_range[1])]
+
+    st.dataframe(
+        df_display.sort_values('날짜', ascending=False),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "날짜": st.column_config.DatetimeColumn("날짜", format="YYYY-MM-DD"),
+            "구분": st.column_config.TextColumn("대분류"),
+            "세부구분": st.column_config.TextColumn("입출고 사유"),
+            "수량": st.column_config.NumberColumn("수량", format="%d 개"),
+            "단가": st.column_config.NumberColumn("단가", format="₩ %d"),
+            "매출원가": st.column_config.NumberColumn("원가(FIFO)", format="₩ %d"),
+            "hash": None
+        }
+    )
+
+    # [2] 실시간 재고 요약 섹션 (신규 추가)
+    st.subheader("📦 현재고 요약 현황 (품목별)")
+    inv_summary_df = get_inventory_summary()
+
+
+    if not inv_summary_df.empty:
+        # 가독성을 위해 3개의 컬럼으로 주요 지표 표시
+        tot_items = len(inv_summary_df)
+        tot_qty = inv_summary_df['현재고 수량'].sum()
+        tot_val = inv_summary_df['재고 자산금액'].sum()
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("관리 품목 수", f"{tot_items} 종")
+        m2.metric("전체 재고 수량", f"{tot_qty:,} 개")
+        m3.metric("전체 자산 가치", f"₩ {tot_val:,.0f}")
+
+        # 요약 테이블 출력
+        st.dataframe(
+            inv_summary_df.sort_values("재고 자산금액", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "현재고 수량": st.column_config.NumberColumn(format="%d 개"),
+                "평균 매입단가": st.column_config.NumberColumn(format="₩ %d"),
+                "재고 자산금액": st.column_config.NumberColumn(format="₩ %d"),
+            }
+        )
+    else:
+        st.info("데이터가 없습니다. 엑셀을 업로드해 주세요.")
+
+    st.divider()
+    # [신규] 차기 출고 예정 상세 표
+    st.subheader("📋 출고 우선순위 현황 (FIFO Queue)")
+    st.caption("현재 보유 재고 중 날짜가 가장 오래되어 '다음 출고 시' 가장 먼저 차감될 데이터입니다.")
+
+    next_out_df = get_next_out_schedule()
+
+    if not next_out_df.empty:
+        st.dataframe(
+            next_out_df.sort_values("1순위 출고예정일"),  # 오래된 순으로 정렬
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "1순위 출고예정일": st.column_config.DatetimeColumn("가장 오래된 입고일", format="YYYY-MM-DD"),
+                "1순위 대기수량": st.column_config.NumberColumn("현 재고(1순위)", format="%d 개"),
+                "1순위 단가": st.column_config.NumberColumn("취득단가", format="₩ %d"),
+                "2순위 출고예정일": st.column_config.DatetimeColumn("차순위 입고일", format="YYYY-MM-DD"),
+                "2순위 대기수량": st.column_config.NumberColumn("차순위 재고(2순위)", format="%d 개"),
+                "전체 재고층 수": st.column_config.NumberColumn("누적 입고 횟수", format="%d 층")
+            }
+        )
+
+    else:
+        st.info("출고 대기 중인 재고가 없습니다.")
 elif app_mode == "데이터 분석/트래킹":
     st.title("🔍 수입 적정재고 검토 대시보드")
     st.info("수입 리드 타임을 고려하여 품목별 발주 필요성을 분석합니다. (기준일: 2026-01-14)")
